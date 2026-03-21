@@ -9,7 +9,7 @@ const PORT = process.env.PORT || 3000;
 const SUPABASE_URL     = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE = process.env.SUPABASE_SERVICE_KEY;
 const CLAUDE_KEY       = process.env.CLAUDE_API_KEY;
-const ALLOWED_ORIGIN   = process.env.ALLOWED_ORIGIN || '*';
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://replydrop-site.onrender.com';
 
 // ── CORS ───────────────────────────────────────────────────────
 app.use(cors({
@@ -70,6 +70,51 @@ app.get('/debug', (req, res) => {
 // ── HEALTH CHECK ───────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'ReplyDrop backend running ✓', time: new Date().toISOString() });
+});
+
+// ── SEND MAGIC LINK ───────────────────────────────────────────
+app.post('/send-magic-link', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'Email required' });
+
+  try {
+    const body = JSON.stringify({
+      email: email.toLowerCase().trim(),
+      create_user: true
+    });
+    const result = await new Promise((resolve, reject) => {
+      const urlObj = new URL(SUPABASE_URL + '/auth/v1/otp');
+      const opts = {
+        hostname: urlObj.hostname,
+        path: urlObj.pathname,
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'apikey': SUPABASE_SERVICE,
+          'Authorization': `Bearer ${SUPABASE_SERVICE}`,
+          'Content-Length': Buffer.byteLength(body)
+        }
+      };
+      const req2 = https.request(opts, r => {
+        let d = '';
+        r.on('data', c => d += c);
+        r.on('end', () => resolve({ status: r.statusCode, body: d }));
+      });
+      req2.on('error', reject);
+      req2.write(body);
+      req2.end();
+    });
+
+    console.log('Magic link result:', result.status, result.body);
+    if (result.status === 200 || result.status === 204) {
+      res.json({ success: true });
+    } else {
+      res.status(400).json({ error: 'Failed to send', detail: result.body });
+    }
+  } catch(e) {
+    console.error('Magic link error:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ── CHECK PRO STATUS ───────────────────────────────────────────
