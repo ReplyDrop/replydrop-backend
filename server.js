@@ -55,6 +55,18 @@ function supabase(path, method, body) {
   });
 }
 
+// ── DEBUG (remove after fixing) ────────────────────────────────
+app.get('/debug', (req, res) => {
+  res.json({
+    supabase_url_set:     !!SUPABASE_URL,
+    supabase_url_value:   SUPABASE_URL ? SUPABASE_URL.substring(0, 30) + '...' : 'NOT SET',
+    service_key_set:      !!SUPABASE_SERVICE,
+    service_key_preview:  SUPABASE_SERVICE ? SUPABASE_SERVICE.substring(0, 20) + '...' : 'NOT SET',
+    claude_key_set:       !!CLAUDE_KEY,
+    allowed_origin:       ALLOWED_ORIGIN
+  });
+});
+
 // ── HEALTH CHECK ───────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({ status: 'ReplyDrop backend running ✓', time: new Date().toISOString() });
