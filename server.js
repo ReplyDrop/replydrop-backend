@@ -66,10 +66,16 @@ app.post('/check-pro', async (req, res) => {
   if (!email) return res.json({ isPro: false });
 
   try {
+    console.log('Checking pro for:', email);
+    console.log('Supabase URL set:', !!SUPABASE_URL);
+    console.log('Service key set:', !!SUPABASE_SERVICE);
+
     const result = await supabase(
       `/rest/v1/subscribers?email=ilike.${encodeURIComponent(email.toLowerCase())}&select=is_pro,plan`,
       'GET', null
     );
+    console.log('Supabase response status:', result.status);
+    console.log('Supabase response data:', JSON.stringify(result.data));
     const row = Array.isArray(result.data) ? result.data[0] : null;
     console.log('Pro check:', email, '→', row?.is_pro);
     res.json({ isPro: row?.is_pro === true, plan: row?.plan || 'free' });
