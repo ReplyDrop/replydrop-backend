@@ -1,6 +1,7 @@
 const express = require('express');
 const cors    = require('cors');
 const https   = require('https');
+const crypto  = require('crypto');
 
 const app  = express();
 const PORT = process.env.PORT || 3000;
@@ -9,7 +10,9 @@ const PORT = process.env.PORT || 3000;
 const SUPABASE_URL     = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE = process.env.SUPABASE_SERVICE_KEY;
 const CLAUDE_KEY       = process.env.CLAUDE_API_KEY;
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'https://replydrop-site.onrender.com';
+const STRIPE_SECRET    = process.env.STRIPE_SECRET_KEY;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+const ALLOWED_ORIGIN   = process.env.ALLOWED_ORIGIN || 'https://replydrop-site.onrender.com';
 
 // ── CORS ───────────────────────────────────────────────────────
 app.use(cors({
@@ -19,7 +22,7 @@ app.use(cors({
 }));
 
 // ── BODY PARSING ───────────────────────────────────────────────
-// Raw body for Stripe webhook signature verification
+// Raw body for Stripe webhook signature verification — MUST come before express.json()
 app.use('/webhook', express.raw({ type: 'application/json' }));
 // JSON for everything else
 app.use(express.json());
@@ -55,7 +58,7 @@ function supabase(path, method, body) {
   });
 }
 
-// ── DEBUG (remove after fixing) ────────────────────────────────
+// ── DEBUG ──────────────────────────────────────────────────────
 app.get('/debug', (req, res) => {
   res.json({
     supabase_url_set:     !!SUPABASE_URL,
@@ -63,6 +66,8 @@ app.get('/debug', (req, res) => {
     service_key_set:      !!SUPABASE_SERVICE,
     service_key_preview:  SUPABASE_SERVICE ? SUPABASE_SERVICE.substring(0, 20) + '...' : 'NOT SET',
     claude_key_set:       !!CLAUDE_KEY,
+    stripe_secret_set:    !!STRIPE_SECRET,
+    stripe_webhook_set:   !!STRIPE_WEBHOOK_SECRET,
     allowed_origin:       ALLOWED_ORIGIN
   });
 });
@@ -118,27 +123,33 @@ app.post('/send-magic-link', async (req, res) => {
 });
 
 // ── CHECK PRO STATUS ───────────────────────────────────────────
+// FIX: Supabase ilike filter must NOT have the value URL-encoded in the path.
+// We build the query string manually to ensure correct format: ilike.value (not ilike.encoded%40value)
 app.post('/check-pro', async (req, res) => {
   const { email } = req.body;
   if (!email) return res.json({ isPro: false });
 
+  const cleanEmail = email.toLowerCase().trim();
+
   try {
-    console.log('Checking pro for:', email);
+    console.log('Checking pro for:', cleanEmail);
     console.log('Supabase URL set:', !!SUPABASE_URL);
     console.log('Service key set:', !!SUPABASE_SERVICE);
 
-    const result = await supabase(
-      `/rest/v1/subscribers?email=ilike.${encodeURIComponent(email.toLowerCase())}&select=is_pro,plan`,
-      'GET', null
-    );
+    // Build path without encodeURIComponent on the email value — Supabase ilike needs raw dots/@ signs
+    const path = `/rest/v1/subscribers?email=ilike.${cleanEmail}&select=is_pro,plan`;
+    const result = await supabase(path, 'GET', null);
+
     console.log('Supabase response status:', result.status);
     console.log('Supabase response data:', JSON.stringify(result.data));
+
     const row = Array.isArray(result.data) ? result.data[0] : null;
-    console.log('Pro check:', email, '→', row?.is_pro);
-    res.json({ isPro: row?.is_pro === true, plan: row?.plan || 'free' });
+    console.log('Pro check result:', cleanEmail, '→ is_pro:', row?.is_pro);
+
+    return res.json({ isPro: row?.is_pro === true, plan: row?.plan || 'free' });
   } catch (e) {
     console.error('Pro check error:', e);
-    res.json({ isPro: false });
+    return res.json({ isPro: false });
   }
 });
 
@@ -233,14 +244,56 @@ Respond ONLY with a JSON array of exactly 3 strings:
 });
 
 // ── STRIPE WEBHOOK ────────────────────────────────────────────
+// FIX: Added proper Stripe signature verification using raw body.
+// The /webhook route receives raw body (set up above before express.json()).
 app.post('/webhook', async (req, res) => {
+  // ── Signature verification ──
+  if (STRIPE_WEBHOOK_SECRET) {
+    const sig = req.headers['stripe-signature'];
+    if (!sig) {
+      console.error('Missing stripe-signature header');
+      return res.status(400).send('Missing signature');
+    }
+    try {
+      // Manual HMAC verification (no stripe npm package required)
+      const parts = sig.split(',').reduce((acc, part) => {
+        const [k, v] = part.split('=');
+        acc[k] = v;
+        return acc;
+      }, {});
+      const timestamp = parts.t;
+      const receivedSig = parts.v1;
+      const payload = `${timestamp}.${req.body}`;
+      const expectedSig = crypto
+        .createHmac('sha256', STRIPE_WEBHOOK_SECRET)
+        .update(payload, 'utf8')
+        .digest('hex');
+      if (receivedSig !== expectedSig) {
+        console.error('Webhook signature mismatch');
+        return res.status(400).send('Invalid signature');
+      }
+      // Reject webhooks older than 5 minutes to prevent replay attacks
+      if (Math.abs(Date.now() / 1000 - parseInt(timestamp)) > 300) {
+        console.error('Webhook timestamp too old');
+        return res.status(400).send('Timestamp expired');
+      }
+    } catch (e) {
+      console.error('Signature verification error:', e);
+      return res.status(400).send('Signature error');
+    }
+  } else {
+    console.warn('⚠️  STRIPE_WEBHOOK_SECRET not set — skipping signature verification');
+  }
+
+  // ── Parse event ──
   let event;
   try { event = JSON.parse(req.body); }
   catch (e) { return res.status(400).send('Invalid JSON'); }
 
   console.log('Stripe event:', event.type);
 
-  async function upsert(email, isPro, plan, stripeId) {
+  // ── Upsert helper ──
+  async function upsertSubscriber(email, isPro, plan, stripeId) {
     const payload = {
       email:    email.toLowerCase().trim(),
       is_pro:   isPro,
@@ -252,41 +305,60 @@ app.post('/webhook', async (req, res) => {
         : { cancelled_at:  new Date().toISOString() })
     };
     const r = await supabase('/rest/v1/subscribers?on_conflict=email', 'POST', payload);
-    console.log('Upsert', email, isPro ? '→ PRO' : '→ free', '| status:', r.status);
+    console.log('Upsert', email, isPro ? '→ PRO ✅' : '→ free ❌', '| HTTP status:', r.status);
+    if (r.status >= 400) console.error('Upsert error response:', JSON.stringify(r.data));
     return r;
   }
 
+  // ── Event handling ──
   try {
     switch (event.type) {
+
+      // Payment completed — grant Pro
       case 'checkout.session.completed': {
         const s     = event.data.object;
         const email = s.customer_details?.email || s.customer_email;
-        if (email) await upsert(email, true, 'pro', s.customer);
+        console.log('checkout.session.completed — email:', email, 'customer:', s.customer);
+        if (email) await upsertSubscriber(email, true, 'pro', s.customer);
         break;
       }
+
+      // Recurring payment succeeded — keep Pro active
       case 'invoice.payment_succeeded': {
         const inv = event.data.object;
-        if (inv.customer_email && inv.subscription)
-          await upsert(inv.customer_email, true, 'pro', inv.customer);
+        if (inv.customer_email && inv.subscription) {
+          console.log('invoice.payment_succeeded — email:', inv.customer_email);
+          await upsertSubscriber(inv.customer_email, true, 'pro', inv.customer);
+        }
         break;
       }
+
+      // Payment failed — revoke Pro
       case 'invoice.payment_failed': {
         const inv = event.data.object;
-        if (inv.customer_email)
-          await upsert(inv.customer_email, false, 'free', inv.customer);
+        if (inv.customer_email) {
+          console.log('invoice.payment_failed — email:', inv.customer_email);
+          await upsertSubscriber(inv.customer_email, false, 'free', inv.customer);
+        }
         break;
       }
+
+      // Subscription cancelled — revoke Pro
       case 'customer.subscription.deleted': {
         const sub   = event.data.object;
         const email = sub.customer_email || sub.metadata?.email;
-        if (email) await upsert(email, false, 'free', sub.customer);
+        console.log('customer.subscription.deleted — email:', email, 'customer:', sub.customer);
+        if (email) await upsertSubscriber(email, false, 'free', sub.customer);
         break;
       }
-      default: console.log('Unhandled:', event.type);
+
+      default:
+        console.log('Unhandled Stripe event type:', event.type);
     }
+
     res.json({ received: true });
   } catch (e) {
-    console.error('Webhook error:', e);
+    console.error('Webhook handler error:', e);
     res.status(500).send('Handler failed');
   }
 });
